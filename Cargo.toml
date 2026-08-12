@@ -1,0 +1,45 @@
+[package]
+name = "stripcut"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Slice a long vertical-scroll comic (webtoon) canvas into upload-ready tiles, cutting in the gutters between panels instead of through artwork. Offline Rust CLI."
+authors = ["printemps.tokyo <develop@printemps.tokyo>"]
+repository = "https://github.com/printemps-tokyo/stripcut"
+homepage = "https://github.com/printemps-tokyo/stripcut"
+readme = "README.md"
+keywords = ["webtoon", "comic", "image", "slice", "cli"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[[bin]]
+name = "stripcut"
+path = "src/main.rs"
+
+[lib]
+name = "stripcut"
+path = "src/lib.rs"
+
+[dependencies]
+# Error context for the thin binary layer (org convention).
+anyhow = "1"
+# Argument parsing (derive API, org convention).
+clap = { version = "4", features = ["derive"] }
+# Decoding and encoding. default-features are off so only the three formats a
+# webtoon platform actually accepts are compiled in; nothing else is pulled in
+# for this tool. Gutter detection is plain pixel arithmetic over the decoded
+# RGBA buffer, so no CV or ML dependency is involved.
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+] }
+
+[dev-dependencies]
+# Scratch directories for the CLI integration tests.
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
