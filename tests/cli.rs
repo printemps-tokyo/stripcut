@@ -1542,3 +1542,216 @@ fn a_tall_canvas_plans_without_trouble() {
     assert!(tiles.len() >= 16, "{} tiles", tiles.len());
     assert_eq!(tiles.last().unwrap().1, 20_000);
 }
+
+// ---------------------------------------------------------------------------
+// --episodes and --preview
+// ---------------------------------------------------------------------------
+
+#[test]
+fn episodes_slice_each_directory_into_its_own_folder() {
+    let tmp = scratch();
+    let ep1 = tmp.path().join("ep01");
+    let ep2 = tmp.path().join("ep02");
+    fs::create_dir_all(&ep1).unwrap();
+    fs::create_dir_all(&ep2).unwrap();
+    let (part, _) = regular_strip(120, 160, 40, 5); // 1000 rows
+    write_png(&ep1, "a.png", &part);
+    write_png(&ep1, "b.png", &part);
+    write_png(&ep2, "only.png", &part);
+    let out_dir = tmp.path().join("out");
+    let out = run(&[
+        "--episodes",
+        ep1.to_str().unwrap(),
+        ep2.to_str().unwrap(),
+        "--max-height",
+        "400",
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = stdout(&out);
+    assert!(doc.contains("\"episode\": \"ep01\""));
+    assert!(doc.contains("\"episode\": \"ep02\""));
+    // ep01's two parts are stacked into one 2000-row canvas.
+    assert!(doc.contains("\"height\": 2000"));
+    let one = listing(&out_dir.join("ep01"));
+    let two = listing(&out_dir.join("ep02"));
+    assert!(one.iter().any(|(n, _)| n == "ep01_001.png"));
+    // Numbering starts over for each episode.
+    assert!(two.iter().any(|(n, _)| n == "ep02_001.png"));
+    assert!(
+        listing(&out_dir).is_empty(),
+        "nothing loose in the top out-dir"
+    );
+
+    // Each sliced folder checks as one episode.
+    let out = run(&[
+        "--check",
+        "--episodes",
+        out_dir.join("ep01").to_str().unwrap(),
+        out_dir.join("ep02").to_str().unwrap(),
+        "--max-height",
+        "400",
+        "--no-color",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("episode: ep01") && text.contains("episode: ep02"));
+}
+
+#[test]
+fn episodes_with_the_same_name_are_refused_before_writing() {
+    let tmp = scratch();
+    let a = tmp.path().join("a").join("ep");
+    let b = tmp.path().join("b").join("ep");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    let (part, _) = regular_strip(80, 100, 20, 3);
+    write_png(&a, "p.png", &part);
+    write_png(&b, "p.png", &part);
+    let out_dir = tmp.path().join("out");
+    let out = run(&[
+        "--episodes",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--max-height",
+        "200",
+        "-o",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("both named \"ep\""));
+    assert!(!out_dir.exists());
+
+    let out = run(&["--episodes", "--join", a.to_str().unwrap()]);
+    assert_eq!(code(&out), 2, "--episodes and --join conflict");
+}
+
+#[test]
+fn dry_run_preview_writes_only_the_preview() {
+    let tmp = scratch();
+    // A full-bleed block in the middle forces a hard cut.
+    let mut img = strip(200, 3000, WHITE, &[(0, 800), (850, 1700), (1750, 3000)]);
+    fill_rows(&mut img, 1800, 2900, Rgba([0, 0, 0, 255]));
+    let page = write_png(tmp.path(), "page.png", &img);
+    let out_dir = tmp.path().join("out");
+    let out = run(&[
+        page.to_str().unwrap(),
+        "--dry-run",
+        "--preview",
+        "--preview-width",
+        "100",
+        "--max-height",
+        "1000",
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--no-color",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("preview: "));
+    let files = listing(&out_dir);
+    assert_eq!(
+        files.len(),
+        1,
+        "only the preview: {:?}",
+        files.iter().map(|f| &f.0).collect::<Vec<_>>()
+    );
+    assert_eq!(files[0].0, "page_preview.png");
+    let preview = image::load_from_memory(&files[0].1).unwrap().to_rgba8();
+    assert_eq!(preview.width(), stripcut::preview::RIBBON + 100);
+    assert_eq!(preview.height(), 1500);
+    let has = |want: [u8; 3]| {
+        preview
+            .pixels()
+            .any(|p| p[0] == want[0] && p[1] == want[1] && p[2] == want[2])
+    };
+    assert!(has([26, 158, 60]), "a green gutter cut");
+    assert!(has([214, 40, 40]), "a red hard cut");
+
+    // A second run refuses to overwrite the preview without --force.
+    let again = run(&[
+        page.to_str().unwrap(),
+        "--preview",
+        "--max-height",
+        "1000",
+        "-o",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&again), 2);
+    assert!(stderr(&again).contains("page_preview.png already exists"));
+
+    // --check over the folder skips the preview.
+    let sliced = run(&[
+        page.to_str().unwrap(),
+        "--max-height",
+        "1000",
+        "-o",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&sliced), 0, "{}", stderr(&sliced));
+    let check = run(&[
+        out_dir.to_str().unwrap(),
+        "--check",
+        "--max-height",
+        "1000",
+        "--json",
+    ]);
+    assert_eq!(code(&check), 0, "{}", stdout(&check));
+    assert!(!stdout(&check).contains("page_preview.png"));
+}
+
+#[test]
+fn slicing_holds_an_episode_to_the_presets_image_count() {
+    let tmp = scratch();
+    // mechacomic-creators accepts at most 60 images per episode.
+    let (img, _) = regular_strip(300, 80, 20, 70);
+    let page = write_png(tmp.path(), "long.png", &img);
+    let out = run(&[
+        page.to_str().unwrap(),
+        "--preset",
+        "mechacomic-creators",
+        "--max-height",
+        "100",
+        "--dry-run",
+        "--no-color",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("episode limits:"), "{text}");
+    assert!(text.contains("at most 60 are accepted per episode"));
+}
+
+#[test]
+fn several_canvases_get_numbered_previews() {
+    let tmp = scratch();
+    let (img, _) = regular_strip(100, 100, 20, 4);
+    let a = write_png(tmp.path(), "a.png", &img);
+    let b = write_png(tmp.path(), "b.png", &img);
+    let out_dir = tmp.path().join("out");
+    let out = run(&[
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--prefix",
+        "ep",
+        "--preview",
+        "--max-height",
+        "300",
+        "-o",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let names: Vec<String> = listing(&out_dir).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&"ep_1_preview.png".to_string()), "{names:?}");
+    assert!(names.contains(&"ep_2_preview.png".to_string()), "{names:?}");
+
+    let wide = run(&[
+        a.to_str().unwrap(),
+        "--gutters",
+        "--preview",
+        "--preview-width",
+        "5000",
+    ]);
+    assert_eq!(code(&wide), 2);
+    assert!(stderr(&wide).contains("--preview-width must be between 1 and 4096"));
+}

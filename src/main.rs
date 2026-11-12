@@ -24,6 +24,7 @@ use stripcut::model::{
 };
 use stripcut::plan::{plan_cuts, PlanOptions};
 use stripcut::presets::{find_preset, preset_names, Preset};
+use stripcut::preview::{render_preview, DEFAULT_PREVIEW_WIDTH, MAX_PREVIEW_WIDTH};
 use stripcut::report::{
     render_json, render_presets_json, render_presets_text, render_text, summary_line, RenderOptions,
 };
@@ -52,9 +53,18 @@ EXIT CODES:
 
 MODES:
   (default)    slice the canvas and write the tiles
-  --dry-run    print the planned cuts and write nothing
+  --dry-run    print the planned cuts and write nothing (but a --preview)
   --gutters    print the detected runs of background rows and stop
   --check      validate images that are already sliced, and stop
+
+  --episodes   treats each input as its own episode: a directory holds that
+               episode's parts (as exported from a PSD or CLIP file), stacked
+               into one canvas and sliced into OUT-DIR/<episode name>/, with
+               numbering starting over. With --check, each directory is
+               checked as one episode.
+  --preview    also writes <name>_preview.png next to the tiles: the canvas
+               scaled down with gutters tinted blue and every cut drawn, green
+               in a gutter and red where it was forced.
 
 TUNING DETECTION:
   A row counts as a gutter row when every pixel in it is the page background
@@ -132,6 +142,18 @@ struct Cli {
     /// Treat every input as one continuous canvas, stacked in order.
     #[arg(long)]
     join: bool,
+
+    /// Treat each input as its own episode, sliced into OUT-DIR/<name>/.
+    #[arg(long, conflicts_with = "join")]
+    episodes: bool,
+
+    /// Also write a scaled-down preview with every cut drawn on it.
+    #[arg(long, conflicts_with = "check")]
+    preview: bool,
+
+    /// Width of the preview's canvas area, in pixels.
+    #[arg(long, value_name = "PX", default_value_t = DEFAULT_PREVIEW_WIDTH)]
+    preview_width: u32,
 
     /// Output format (default: keep the source format).
     #[arg(long, value_name = "FMT")]
@@ -217,12 +239,25 @@ fn run() -> Result<i32> {
     if cli.inputs.is_empty() {
         bail!("no input given. Pass one or more image files or a directory, or --list-presets");
     }
-    let inputs = collect_inputs(&cli.inputs)?;
+    if cli.preview_width == 0 || cli.preview_width > MAX_PREVIEW_WIDTH {
+        bail!("--preview-width must be between 1 and {MAX_PREVIEW_WIDTH}");
+    }
 
-    let reports = if cli.check {
-        vec![run_check(&cli, preset, &inputs)?]
+    let reports = if cli.episodes {
+        run_episodes(&cli, preset)?
     } else {
-        run_slice(&cli, preset, &inputs)?
+        let inputs = collect_inputs(&cli.inputs)?;
+        if cli.check {
+            vec![run_check(&cli, preset, &inputs)?]
+        } else {
+            let target = Target {
+                out_dir: cli.out_dir.clone(),
+                episode: None,
+            };
+            let mut reports = run_slice(&cli, preset, &inputs, &target)?;
+            apply_episode_limits(preset, &mut reports);
+            reports
+        }
     };
 
     if cli.json {
@@ -287,7 +322,7 @@ fn collect_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         {
             let entry = entry.with_context(|| format!("cannot list {}", path.display()))?;
             let child = entry.path();
-            if child.is_file() && has_image_extension(&child) {
+            if child.is_file() && has_image_extension(&child) && !is_preview(&child) {
                 found.insert(child);
             }
         }
@@ -300,6 +335,14 @@ fn collect_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         out.extend(found);
     }
     Ok(out)
+}
+
+/// Whether a file is one of stripcut's own previews, which a directory scan
+/// skips so a preview never becomes a part or gets checked as a tile.
+fn is_preview(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.ends_with("_preview"))
 }
 
 /// The format token for an already-encoded file, when stripcut can write it.
@@ -427,14 +470,14 @@ fn canvas_stem(path: &Path) -> String {
         .unwrap_or_else(|| "tile".to_string())
 }
 
-fn build_canvases(cli: &Cli, inputs: &[PathBuf]) -> Result<Vec<Canvas>> {
+fn build_canvases(inputs: &[PathBuf], join: bool) -> Result<Vec<Canvas>> {
     let mut loaded = Vec::with_capacity(inputs.len());
     for path in inputs {
         let (pixels, format) = load_canvas(path)?;
         loaded.push((path.clone(), pixels, format));
     }
 
-    if !cli.join {
+    if !join {
         return Ok(loaded
             .into_iter()
             .map(|(path, pixels, format)| Canvas {
@@ -476,12 +519,37 @@ fn build_canvases(cli: &Cli, inputs: &[PathBuf]) -> Result<Vec<Canvas>> {
     }])
 }
 
+/// Where a run writes and which episode it belongs to.
+struct Target {
+    out_dir: PathBuf,
+    episode: Option<String>,
+}
+
+/// One canvas's place in its run, for naming its preview.
+#[derive(Clone, Copy)]
+struct Slot {
+    /// 1-based position among the run's canvases.
+    index: usize,
+    /// How many canvases the run has.
+    of: usize,
+}
+
 fn run_slice(
     cli: &Cli,
     preset: Option<&'static Preset>,
     inputs: &[PathBuf],
+    target: &Target,
 ) -> Result<Vec<RunReport>> {
-    let canvases = build_canvases(cli, inputs)?;
+    let canvases = build_canvases(inputs, cli.join)?;
+    run_canvases(cli, preset, &canvases, target)
+}
+
+fn run_canvases(
+    cli: &Cli,
+    preset: Option<&'static Preset>,
+    canvases: &[Canvas],
+    target: &Target,
+) -> Result<Vec<RunReport>> {
     let mode = if cli.gutters {
         "gutters"
     } else if cli.dry_run {
@@ -494,12 +562,131 @@ fn run_slice(
     // Numbering runs across the whole episode, so a directory of parts comes
     // out as one continuous sequence rather than restarting at 1 per file.
     let mut next_index = cli.start_index;
-    for canvas in &canvases {
-        let (report, used) = slice_one(cli, preset, canvas, mode, next_index)?;
+    for (i, canvas) in canvases.iter().enumerate() {
+        let slot = Slot {
+            index: i + 1,
+            of: canvases.len(),
+        };
+        let (report, used) = slice_one(cli, preset, canvas, mode, next_index, target, slot)?;
         next_index = used;
         reports.push(report);
     }
     Ok(reports)
+}
+
+/// The name an episode input goes by: a directory's name or a file's stem.
+fn episode_name(path: &Path) -> String {
+    let base = if path.is_dir() {
+        path.file_name()
+    } else {
+        path.file_stem()
+    };
+    base.map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty() && s != "." && s != "..")
+        .unwrap_or_else(|| "episode".to_string())
+}
+
+/// `--episodes`: each input is one episode. A directory's images are its
+/// parts, stacked in sorted order into one canvas; the tiles go to
+/// OUT-DIR/<name>/ and numbering starts over for every episode.
+fn run_episodes(cli: &Cli, preset: Option<&'static Preset>) -> Result<Vec<RunReport>> {
+    // Resolve every episode before doing any work, so a name clash or an
+    // unreadable input stops the batch before the first file is written.
+    let mut names = BTreeSet::new();
+    let mut episodes = Vec::with_capacity(cli.inputs.len());
+    for path in &cli.inputs {
+        let name = episode_name(path);
+        if !names.insert(name.clone()) {
+            bail!(
+                "two episodes are both named {name:?}; each episode gets OUT-DIR/<name>, so rename one"
+            );
+        }
+        let images = collect_inputs(std::slice::from_ref(path))?;
+        episodes.push((path, name, images));
+    }
+
+    let mut reports = Vec::with_capacity(episodes.len());
+    for (path, name, images) in episodes {
+        if cli.check {
+            let mut report = run_check(cli, preset, &images)?;
+            report.inputs = vec![display(path)];
+            report.episode = Some(name);
+            reports.push(report);
+            continue;
+        }
+        let mut canvases = build_canvases(&images, true)?;
+        for canvas in &mut canvases {
+            canvas.stem = name.clone();
+        }
+        let target = Target {
+            out_dir: cli.out_dir.join(&name),
+            episode: Some(name),
+        };
+        let mut episode_reports = run_canvases(cli, preset, &canvases, &target)?;
+        for report in &mut episode_reports {
+            report.inputs = vec![display(path)];
+        }
+        apply_episode_limits(preset, &mut episode_reports);
+        reports.extend(episode_reports);
+    }
+    Ok(reports)
+}
+
+/// Hold the tiles of one episode to the preset's episode-level limits (image
+/// count, total bytes). Problems go on the episode's last report.
+fn apply_episode_limits(preset: Option<&'static Preset>, reports: &mut [RunReport]) {
+    let Some(preset) = preset else {
+        return;
+    };
+    if reports.iter().any(|r| r.mode == "gutters") {
+        return;
+    }
+    let limits = CheckLimits::from_preset(preset);
+    let count: usize = reports.iter().map(|r| r.tiles.len()).sum();
+    let bytes: u64 = reports.iter().map(RunReport::total_bytes).sum();
+    let problems = check_episode(count, bytes, &limits);
+    if let Some(last) = reports.last_mut() {
+        if !problems.is_empty() {
+            last.ok = false;
+        }
+        last.episode_problems = problems;
+    }
+}
+
+/// Write the preview image for a canvas, refusing to overwrite without
+/// --force. Returns the path written.
+fn write_preview(
+    cli: &Cli,
+    canvas: &Canvas,
+    slot: Slot,
+    gutters: &[stripcut::analyze::Gutter],
+    tiles: &[stripcut::plan::Tile],
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    let path = out_dir.join(preview_name(cli, canvas, slot));
+    if path.exists() && !cli.force {
+        bail!(
+            "{} already exists. Pass --force to overwrite, or choose another --out-dir",
+            path.display()
+        );
+    }
+    fs::create_dir_all(out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
+    let img = render_preview(&canvas.pixels, gutters, tiles, cli.preview_width);
+    img.save_with_format(&path, ImageFormat::Png)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+/// `<prefix>_preview.png`, or `<prefix>_<n>_preview.png` when the run has
+/// several canvases, so each canvas gets its own preview even when they share
+/// a --prefix or a file stem.
+fn preview_name(cli: &Cli, canvas: &Canvas, slot: Slot) -> String {
+    let prefix = cli.prefix.clone().unwrap_or_else(|| canvas.stem.clone());
+    if slot.of > 1 {
+        format!("{prefix}_{}_preview.png", slot.index)
+    } else {
+        format!("{prefix}_preview.png")
+    }
 }
 
 /// Resolved background colour plus where it came from.
@@ -545,6 +732,8 @@ fn slice_one(
     canvas: &Canvas,
     mode: &'static str,
     start_index: u32,
+    target: &Target,
+    slot: Slot,
 ) -> Result<(RunReport, u32)> {
     let edge_margin = cli.edge_margin.unwrap_or(0);
     let tolerance = cli.tolerance.unwrap_or(DEFAULT_TOLERANCE);
@@ -553,6 +742,7 @@ fn slice_one(
 
     let mut report = RunReport::new(mode);
     report.inputs = cli.inputs.iter().map(|p| display(p)).collect();
+    report.episode = target.episode.clone();
     report.preset = preset;
     report.canvas = Some(CanvasInfo {
         width: canvas.pixels.width(),
@@ -581,6 +771,10 @@ fn slice_one(
             quality: None,
             max_bytes: None,
         });
+        if cli.preview {
+            let path = write_preview(cli, canvas, slot, &report.gutters, &[], &target.out_dir)?;
+            report.preview = Some(display(&path));
+        }
         return Ok((report, start_index));
     }
 
@@ -649,7 +843,7 @@ fn slice_one(
     let pad = last_number.to_string().len().max(3);
 
     let writing = mode == "slice";
-    let out_dir = &cli.out_dir;
+    let out_dir = &target.out_dir;
     if writing {
         report.out_dir = Some(display(out_dir));
     }
@@ -663,7 +857,8 @@ fn slice_one(
         targets.push((number, name));
     }
     if writing && !cli.force {
-        for (_, name) in &targets {
+        let preview = cli.preview.then(|| preview_name(cli, canvas, slot));
+        for name in targets.iter().map(|(_, n)| n).chain(preview.as_ref()) {
             let path = out_dir.join(name);
             if path.exists() {
                 bail!(
@@ -672,6 +867,10 @@ fn slice_one(
                 );
             }
         }
+    }
+    if cli.preview {
+        let path = write_preview(cli, canvas, slot, &report.gutters, &plan.tiles, out_dir)?;
+        report.preview = Some(display(&path));
     }
     if writing {
         fs::create_dir_all(out_dir)

@@ -60,6 +60,7 @@ pub mod json;
 pub mod model;
 pub mod plan;
 pub mod presets;
+pub mod preview;
 pub mod report;
 
 pub use analyze::{

@@ -115,6 +115,10 @@ pub struct RunReport {
     pub mode: &'static str,
     pub inputs: Vec<String>,
     pub out_dir: Option<String>,
+    /// The episode's name under `--episodes`.
+    pub episode: Option<String>,
+    /// Where the `--preview` image was written.
+    pub preview: Option<String>,
     pub preset: Option<&'static Preset>,
     pub canvas: Option<CanvasInfo>,
     pub settings: Option<Settings>,
@@ -123,7 +127,8 @@ pub struct RunReport {
     pub checked: Vec<CheckItem>,
     /// The limits `--check` held the files to.
     pub limits: Option<CheckLimits>,
-    /// Episode-level `--check` violations: too many images, too many bytes.
+    /// Episode-level violations (too many images, too many bytes): from
+    /// `--check`, and from slicing when the preset publishes those limits.
     pub episode_problems: Vec<String>,
     pub warnings: Vec<Warning>,
     /// False when the run failed a limit it was asked to respect.
@@ -136,6 +141,8 @@ impl RunReport {
             mode,
             inputs: Vec::new(),
             out_dir: None,
+            episode: None,
+            preview: None,
             preset: None,
             canvas: None,
             settings: None,

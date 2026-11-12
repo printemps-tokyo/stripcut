@@ -58,6 +58,9 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// The full human-readable report for any mode, including the trailing caveat.
 pub fn render_text(report: &RunReport, opts: RenderOptions) -> String {
     let mut out = format!("stripcut: {}\n", report.mode);
+    if let Some(episode) = &report.episode {
+        out.push_str(&format!("episode: {episode}\n"));
+    }
 
     if let Some(canvas) = &report.canvas {
         out.push_str(&format!(
@@ -87,12 +90,23 @@ pub fn render_text(report: &RunReport, opts: RenderOptions) -> String {
     if let Some(dir) = &report.out_dir {
         out.push_str(&format!("out-dir: {dir}\n"));
     }
+    if let Some(preview) = &report.preview {
+        out.push_str(&format!("preview: {preview}\n"));
+    }
     out.push('\n');
 
     match report.mode {
         "gutters" => out.push_str(&gutter_table(&report.gutters, report.settings.as_ref())),
         "check" => out.push_str(&check_table(report, opts)),
         _ => out.push_str(&tile_table(report, opts)),
+    }
+
+    if report.mode != "check" && !report.episode_problems.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("{}:\n", paint(opts, "31", "episode limits")));
+        for problem in &report.episode_problems {
+            out.push_str(&format!("  {}  {problem}\n", paint(opts, "31", "FAIL")));
+        }
     }
 
     if !report.warnings.is_empty() {
@@ -619,6 +633,14 @@ fn run_json(report: &RunReport) -> String {
     out.push_str(&format!(
         "  \"out_dir\": {},\n",
         opt_str(report.out_dir.as_deref())
+    ));
+    out.push_str(&format!(
+        "  \"episode\": {},\n",
+        opt_str(report.episode.as_deref())
+    ));
+    out.push_str(&format!(
+        "  \"preview\": {},\n",
+        opt_str(report.preview.as_deref())
     ));
 
     match report.preset {

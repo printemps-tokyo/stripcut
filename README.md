@@ -71,7 +71,54 @@ stripcut part_a.png part_b.png part_c.png --join --preset webtoon-canvas
 
 # Validate what you are about to upload
 stripcut out --check --preset webtoon-canvas
+
+# Look at every planned seam in one picture before writing anything
+stripcut episode.png --dry-run --preview --preset webtoon-canvas
+
+# A whole season at once: one folder of exported parts per episode
+stripcut --episodes ep01 ep02 ep03 --preset webtoon-canvas -o out
+stripcut --episodes out/ep01 out/ep02 out/ep03 --check --preset webtoon-canvas
 ```
+
+## Previews
+
+`--preview` writes `<name>_preview.png` next to the tiles (in `--dry-run` and
+`--gutters` it is the only file written; a run with several canvases numbers
+them, `<name>_1_preview.png` and so on): the whole canvas scaled to
+`--preview-width` pixels wide (240 by default, at most 4096; a preview is never
+larger than the canvas, nor more than 30,000 pixels tall), with
+
+- the gutter runs stripcut found tinted blue,
+- every cut drawn across the full width: green where it sits in a gutter, red
+  where no gutter qualified and the cut was forced (the seams to inspect),
+- a ribbon down the left that alternates shade tile by tile.
+
+It is the quickest way to see whether the cuts land where you would put them.
+Directory scans (for parts and for `--check`) skip `*_preview.png` files, so a
+preview never ends up stacked into a canvas or checked as a tile.
+
+## Several episodes at once
+
+An episode often arrives as several images, for example when it was drawn in
+parts or exported page by page from a PSD or CLIP file. With `--episodes`,
+each input is one episode:
+
+- a directory holds that episode's parts, stacked in sorted order into one
+  canvas (as `--join` does for a single episode),
+- a single file is an episode on its own,
+- the tiles go to `OUT-DIR/<episode name>/`, named after the episode, with
+  numbering starting over at `--start-index` for each one,
+- names are checked up front: two inputs with the same name stop the batch
+  before anything is written.
+
+With `--check`, `--episodes` checks each directory as one episode, so the
+per-episode limits (image count, total size) apply to each folder separately.
+
+When a preset publishes episode-level limits, slicing (and `--dry-run`) also
+holds the planned tiles to them, per episode, and reports a breach under
+"episode limits" with exit 1, the same way `--check` would after the fact. As
+with a tile over `--max-bytes`, the tiles are still written, so you can look at
+them; the exit code is what tells a script the episode would be refused.
 
 ## How gutter detection works
 
@@ -232,6 +279,9 @@ line keep the order you typed them, which is what `--join` needs.
 | `--edge-margin PX` | 0 | ignore this many pixels at each side of every row |
 | `--bg HEX` | auto-detected | page background, e.g. `ffffff` or `0000` for transparent |
 | `--join` | off | treat every input as one continuous canvas |
+| `--episodes` | off | treat each input (a directory of parts, or a file) as its own episode, written to `OUT-DIR/<name>/` |
+| `--preview` | off | also write `<name>_preview.png` with every cut drawn on the scaled canvas |
+| `--preview-width PX` | 240 | width of the preview's canvas area |
 | `--format FMT` | the source format | `png`, `jpg` or `webp` |
 | `--quality N` | 85 | encoder quality for `jpg`, 1-100 |
 | `--prefix NAME` | the input's file stem | output filename prefix |
@@ -302,6 +352,8 @@ twenty. A consumer never has to branch on how many inputs were given.
       "ok": true,
       "inputs": ["episode.png"],
       "out_dir": "out",    // null unless tiles were written
+      "episode": null,     // the episode's name under --episodes
+      "preview": null,     // the preview's path under --preview
       "preset": {          // null when no --preset was given
         "name": "webtoon-canvas",
         "platform": "WEBTOON CANVAS",
